@@ -278,7 +278,7 @@ def make_handler(db_path, credential_store, ansible_runner):
     return Handler
 
 
-def create_server(db_path, host="127.0.0.1", port=8000, credential_store=None, ansible_runner=None):
+def create_server(db_path, host="0.0.0.0", port=8000, credential_store=None, ansible_runner=None):
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connect(db_path).close()
