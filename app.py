@@ -9,8 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from ansible_runner import run_ansible_job
-from credential_store import WindowsCredentialStore
+from ansible_runner import ansible_location_label, run_ansible_job, uses_wsl
+from credential_store import get_credential_store
 
 ROOT = Path(__file__).resolve().parent
 
@@ -90,7 +90,7 @@ def make_handler(db_path, credential_store, ansible_runner):
             try:
                 credentials = credential_store.load()
             except Exception:
-                return self.send_json(500, {"error": "Could not access the saved Windows Credential Manager entry."})
+                return self.send_json(500, {"error": "Could not access the saved credential store entry."})
             if not credentials:
                 return self.send_json(400, {"error": "Set the default root password in Credentials before running Ansible."})
             with database(db_path) as db:
@@ -107,7 +107,7 @@ def make_handler(db_path, credential_store, ansible_runner):
             if mode == "playbook":
                 playbook_path = str(body.get("playbook_path", "")).strip()
                 if not playbook_path or len(playbook_path) > 1024:
-                    return self.send_json(400, {"error": "Enter an absolute WSL path to an Ansible playbook."})
+                    return self.send_json(400, {"error": "Enter an absolute path to an Ansible playbook."})
                 job["playbook_path"] = playbook_path
             elif mode == "command":
                 command = str(body.get("command", "")).strip()
@@ -150,13 +150,23 @@ def make_handler(db_path, credential_store, ansible_runner):
                 try:
                     credentials = credential_store.load()
                 except Exception:
-                    return self.send_json(500, {"error": "Could not access Windows Credential Manager."})
+                    return self.send_json(500, {"error": "Could not access the saved credential store."})
+                location = getattr(credential_store, "location", "the credential store")
                 if not credentials:
-                    return self.send_json(200, {"configured": False, "username": "root", "password": ""})
+                    return self.send_json(200, {"configured": False, "username": "root", "password": "",
+                                                "store": location})
                 reveal = parse_qs(urlparse(self.path).query).get("reveal") == ["1"]
                 return self.send_json(200, {
-                    "configured": True, "username": credentials["username"],
+                    "configured": True, "username": credentials["username"], "store": location,
                     "password": credentials["password"] if reveal else "••••••••",
+                })
+            if path == "/api/platform":
+                return self.send_json(200, {
+                    "credential_store": getattr(credential_store, "location", "the credential store"),
+                    "ansible_location": ansible_location_label(),
+                    "ansible_in_wsl": uses_wsl(),
+                    "playbook_path_hint": ("An absolute Linux path inside the WSL distribution."
+                                           if uses_wsl() else "An absolute path on this machine."),
                 })
             if path == "/" or path in ("/index.html", "/app.js", "/styles.css"):
                 target = ROOT / ("index.html" if path == "/" else path.lstrip("/"))
@@ -249,7 +259,7 @@ def make_handler(db_path, credential_store, ansible_runner):
             except sqlite3.Error:
                 return self.send_json(500, {"error": "The local database could not complete that request."})
             except OSError:
-                return self.send_json(500, {"error": "Could not access Windows Credential Manager."})
+                return self.send_json(500, {"error": "Could not access the saved credential store."})
 
         def do_DELETE(self):
             path = urlparse(self.path).path
@@ -272,9 +282,11 @@ def create_server(db_path, host="127.0.0.1", port=8000, credential_store=None, a
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connect(db_path).close()
-    credential_store = credential_store or WindowsCredentialStore()
+    credential_store = credential_store or get_credential_store()
     ansible_runner = ansible_runner or run_ansible_job
-    return ThreadingHTTPServer((host, port), make_handler(db_path, credential_store, ansible_runner))
+    server = ThreadingHTTPServer((host, port), make_handler(db_path, credential_store, ansible_runner))
+    server.credential_store_location = getattr(credential_store, "location", "the credential store")
+    return server
 
 
 if __name__ == "__main__":
@@ -282,6 +294,8 @@ if __name__ == "__main__":
     server = create_server(db_path, port=int(os.environ.get("PORT", "8765")))
     print(f"Classroom Roster is running at http://{server.server_address[0]}:{server.server_port}")
     print(f"Local database: {db_path}")
+    print(f"Credentials: {server.credential_store_location}")
+    print(f"Ansible runs on: {ansible_location_label()}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

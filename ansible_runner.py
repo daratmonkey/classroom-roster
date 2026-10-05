@@ -1,9 +1,14 @@
+"""Run Ansible jobs locally on Linux/macOS, or through WSL when the host is Windows."""
+
 import json
 import os
 import subprocess
+import sys
 
 
-_WSL_SCRIPT = r'''
+# Runs inside the target Linux environment. Kept as a -c script so the shared
+# root password travels on stdin instead of appearing in a process argument list.
+_ANSIBLE_SCRIPT = r'''
 import json, os, pathlib, secrets, shlex, shutil, subprocess, sys, tempfile
 request = json.load(sys.stdin)
 password = request.pop("password")
@@ -11,7 +16,7 @@ try:
     executable = shutil.which("ansible-playbook")
     vault_executable = shutil.which("ansible-vault")
     if not executable or not vault_executable:
-        raise RuntimeError("Ansible is not installed in the configured WSL distribution.")
+        raise RuntimeError("Ansible is not installed, or ansible-playbook/ansible-vault are not on PATH.")
     hosts = request.get("hosts", [])
     if not hosts:
         raise RuntimeError("This class has no student hosts to target.")
@@ -66,7 +71,7 @@ try:
         elif mode == "playbook":
             playbook_path = pathlib.Path(request["playbook_path"]).expanduser()
             if not playbook_path.is_absolute() or not playbook_path.is_file():
-                raise RuntimeError("Playbook path must be an existing absolute WSL/Linux path.")
+                raise RuntimeError("Playbook path must be an existing absolute path in the Ansible environment.")
             cwd = str(playbook_path.parent)
         else:
             raise RuntimeError("Unsupported Ansible job type.")
@@ -89,23 +94,48 @@ except Exception as error:
 '''
 
 
+def uses_wsl():
+    """True when the app must shell into a WSL distribution to reach Ansible."""
+    return os.name == "nt"
+
+
+def ansible_location_label():
+    """Human-readable description of where Ansible runs, for UI copy."""
+    if uses_wsl():
+        return f"WSL distribution {wsl_distro()}"
+    return "this machine"
+
+
+def wsl_distro():
+    return os.environ.get("CLASSROOM_WSL_DISTRO", "Ubuntu")
+
+
+def _command(distro):
+    if uses_wsl():
+        return ["wsl.exe", "-d", distro or wsl_distro(), "--", "python3", "-c", _ANSIBLE_SCRIPT], True
+    return [sys.executable or "python3", "-c", _ANSIBLE_SCRIPT], False
+
+
 def run_ansible_job(job, password, distro=None, timeout=330):
-    """Run one playbook or generated command playbook in WSL without argv secrets."""
-    distro = distro or os.environ.get("CLASSROOM_WSL_DISTRO", "Ubuntu")
+    """Run one playbook or generated command playbook without argv secrets."""
+    argv, through_wsl = _command(distro)
     payload = {**job, "password": password}
     try:
         result = subprocess.run(
-            ["wsl.exe", "-d", distro, "--", "python3", "-c", _WSL_SCRIPT],
+            argv,
             input=json.dumps(payload), capture_output=True, text=True,
             timeout=timeout, check=False,
         )
     except FileNotFoundError:
-        return {"ok": False, "error": "WSL was not found. Install WSL and configure a Linux distribution."}
+        if through_wsl:
+            return {"ok": False, "error": "WSL was not found. Install WSL and configure a Linux distribution."}
+        return {"ok": False, "error": "Python was not found, so the Ansible job could not start."}
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"The WSL Ansible job timed out after {timeout} seconds."}
+        where = "WSL Ansible job" if through_wsl else "Ansible job"
+        return {"ok": False, "error": f"The {where} timed out after {timeout} seconds."}
     try:
         response = json.loads(result.stdout.strip())
     except json.JSONDecodeError:
-        return {"ok": False, "error": "Could not read the WSL Ansible response.",
-                "stderr": result.stderr[-4000:]}
+        where = "WSL Ansible" if through_wsl else "Ansible"
+        return {"ok": False, "error": f"Could not read the {where} response.", "stderr": result.stderr[-4000:]}
     return response

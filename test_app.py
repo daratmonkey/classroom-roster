@@ -1,12 +1,18 @@
 import json
+import os
+import sys
 import tempfile
 import threading
+import types
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
+import ansible_runner
 from app import create_server
+from credential_store import FileCredentialStore, KeyringCredentialStore, WindowsCredentialStore, get_credential_store
 
 
 class FakeCredentials:
@@ -240,6 +246,164 @@ class ClassroomRosterTests(unittest.TestCase):
             "role": "observer", "name": "Pat", "username": "pat", "ip_address": "127.0.0.1"
         })
         self.assertEqual(status, 400)
+
+
+class FileCredentialStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.store = FileCredentialStore(path=Path(self.temp_dir.name) / "nested" / "credentials.json")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_missing_file_loads_as_none(self):
+        self.assertIsNone(self.store.load())
+
+    def test_round_trip_persists_owner_only_file(self):
+        self.store.save("root", "lab-secret")
+        self.assertEqual(self.store.load(), {"username": "root", "password": "lab-secret"})
+        mode = self.store.path.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600, f"expected 0600, found {oct(mode)}")
+
+    def test_replaces_previous_password(self):
+        self.store.save("root", "first")
+        self.store.save("root", "second")
+        self.assertEqual(self.store.load()["password"], "second")
+
+    def test_rejects_non_root_username_and_empty_password(self):
+        with self.assertRaises(ValueError):
+            self.store.save("admin", "lab-secret")
+        with self.assertRaises(ValueError):
+            self.store.save("root", "")
+
+    def test_corrupt_file_raises_instead_of_crashing_silently(self):
+        self.store.path.parent.mkdir(parents=True)
+        self.store.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            self.store.load()
+
+
+class CredentialBackendSelectionTests(unittest.TestCase):
+    def test_windows_selects_credential_manager(self):
+        sentinel = object()
+        with mock.patch.object(os, "name", "nt"), \
+             mock.patch("credential_store.WindowsCredentialStore", return_value=sentinel) as windows:
+            self.assertIs(get_credential_store(), sentinel)
+        windows.assert_called_once()
+
+    def test_linux_prefers_keyring_when_available(self):
+        fake_keyring = types.ModuleType("keyring")
+        fake_keyring.set_password = lambda **kwargs: None
+        fake_keyring.get_password = lambda *args: None
+        fake_keyring.get_keyring = lambda: object()
+        with mock.patch.object(os, "name", "posix"), \
+             mock.patch.dict(sys.modules, {"keyring": fake_keyring}):
+            self.assertIsInstance(get_credential_store(), KeyringCredentialStore)
+
+    def test_linux_falls_back_to_file_store_without_keyring(self):
+        with mock.patch.object(os, "name", "posix"), \
+             mock.patch.object(KeyringCredentialStore, "available", staticmethod(lambda: False)):
+            self.assertIsInstance(get_credential_store(), FileCredentialStore)
+
+    def test_unusable_keyring_falls_back_instead_of_crashing(self):
+        def explode():
+            raise RuntimeError("no usable backend")
+
+        fake_keyring = types.ModuleType("keyring")
+        fake_keyring.get_keyring = explode
+        with mock.patch.object(os, "name", "posix"), \
+             mock.patch.dict(sys.modules, {"keyring": fake_keyring}):
+            self.assertIsInstance(get_credential_store(), FileCredentialStore)
+
+    def test_credential_store_module_imports_without_windows_dlls(self):
+        # Importing must not require Advapi32 or a Windows-only ctypes type.
+        self.assertTrue(hasattr(WindowsCredentialStore, "location"))
+        self.assertTrue(FileCredentialStore().location)
+        with self.assertRaises(RuntimeError):
+            WindowsCredentialStore()
+
+
+class AnsibleInvocationTests(unittest.TestCase):
+    def _run_with_os_name(self, name):
+        job = {"mode": "command", "command": "uname -a", "hosts": [{"id": 1, "name": "S1",
+                                                                    "ip_address": "10.0.0.11", "username": "root"}]}
+        with mock.patch.object(ansible_runner.os, "name", name), \
+             mock.patch.object(ansible_runner.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout=json.dumps({"ok": True, "stdout": "", "stderr": ""}), stderr="")
+            result = ansible_runner.run_ansible_job(job, "lab-secret")
+        self.assertTrue(result["ok"])
+        return run.call_args.args[0]
+
+    def test_windows_invokes_wsl(self):
+        argv = self._run_with_os_name("nt")
+        self.assertEqual(argv[:4], ["wsl.exe", "-d", "Ubuntu", "--"])
+        self.assertEqual(argv[4:6], ["python3", "-c"])
+        self.assertNotIn("lab-secret", " ".join(argv))
+
+    def test_linux_invokes_the_current_interpreter_directly(self):
+        argv = self._run_with_os_name("posix")
+        self.assertNotIn("wsl.exe", argv)
+        self.assertEqual(argv[1], "-c")
+        self.assertTrue(argv[0].endswith("python3") or "python" in Path(argv[0]).name)
+        self.assertNotIn("lab-secret", " ".join(argv))
+
+    def test_missing_wsl_binary_reports_install_hint(self):
+        job = {"mode": "command", "command": "uname -a", "hosts": [{"id": 1, "name": "S1",
+                                                                    "ip_address": "10.0.0.11", "username": "root"}]}
+        with mock.patch.object(ansible_runner.os, "name", "nt"), \
+             mock.patch.object(ansible_runner.subprocess, "run", side_effect=FileNotFoundError):
+            result = ansible_runner.run_ansible_job(job, "lab-secret")
+        self.assertIn("WSL", result["error"])
+
+    def test_location_label_reflects_the_host(self):
+        with mock.patch.object(ansible_runner.os, "name", "posix"):
+            self.assertEqual(ansible_runner.ansible_location_label(), "this machine")
+        with mock.patch.object(ansible_runner.os, "name", "nt"), \
+             mock.patch.dict(os.environ, {"CLASSROOM_WSL_DISTRO": "Ubuntu"}):
+            self.assertIn("Ubuntu", ansible_runner.ansible_location_label())
+
+
+class CrossPlatformInterfaceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db_path = Path(self.temp_dir.name) / "test.sqlite3"
+        self.server = create_server(db_path, credential_store=FakeCredentials())
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temp_dir.cleanup()
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path) as response:
+            return json.loads(response.read())
+
+    def test_platform_endpoint_describes_credential_store_and_ansible_host(self):
+        payload = self.get("/api/platform")
+        self.assertIn("credential_store", payload)
+        self.assertIn("ansible_location", payload)
+        self.assertIsInstance(payload["ansible_in_wsl"], bool)
+        self.assertTrue(payload["playbook_path_hint"])
+
+    def test_credentials_response_reports_the_active_store(self):
+        payload = self.get("/api/ansible/credentials")
+        self.assertEqual(payload["configured"], False)
+        self.assertIn("store", payload)
+
+    def test_ui_copy_is_not_hardcoded_to_one_platform(self):
+        with urllib.request.urlopen(self.base + "/app.js") as response:
+            script = response.read().decode()
+        with urllib.request.urlopen(self.base + "/index.html") as response:
+            markup = response.read().decode()
+        self.assertNotIn("Windows Credential Manager", script)
+        self.assertNotIn("inside WSL", markup)
+        self.assertIn("loadPlatform()", script)
+        self.assertIn('id="credential-store-copy"', markup)
+        self.assertIn('id="playbook-path-note"', markup)
 
 
 if __name__ == "__main__":

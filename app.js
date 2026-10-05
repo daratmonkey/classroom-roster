@@ -142,6 +142,15 @@ themeToggle.addEventListener('click', () => {
   applyTheme(nextTheme);
   try { localStorage.setItem('classroom-theme', nextTheme); } catch (_) { /* Theme still works for this visit. */ }
 });
+let platform = null;
+async function loadPlatform() {
+  try { platform = await api('/api/platform'); } catch (_) { platform = null; }
+  if (!platform) return;
+  document.querySelector('#playbook-path-note').textContent =
+    `Use an absolute path where Ansible runs (${platform.ansible_location}).`;
+  document.querySelector('#credential-store-copy').textContent =
+    `Credentials are stored in ${platform.credential_store}, not the roster database; use only on your authorized lab hosts.`;
+}
 let activeJob = null;
 async function openCredentials() {
   const passwordField = document.querySelector('#ssh-password');
@@ -152,8 +161,9 @@ async function openCredentials() {
   const note = document.querySelector('#credential-note');
   try {
     const current = await api('/api/ansible/credentials');
+    const store = current.store || (platform && platform.credential_store) || 'the credential store';
     note.textContent = current.configured
-      ? 'A password is saved in Windows Credential Manager. Reveal it or enter a replacement.'
+      ? `A password is saved in ${store}. Reveal it or enter a replacement.`
       : 'No password saved yet.';
     document.querySelector('#reveal-password').disabled = !current.configured;
   } catch (error) { note.textContent = error.message; }
@@ -208,7 +218,8 @@ document.querySelector('#credentials-form').addEventListener('submit', async eve
     }) });
     document.querySelector('#ssh-password').value = '';
     document.querySelector('#ssh-password').type = 'password';
-    document.querySelector('#credential-note').textContent = 'Default root password saved in Windows Credential Manager.';
+    const store = (platform && platform.credential_store) || 'the credential store';
+    document.querySelector('#credential-note').textContent = `Default root password saved in ${store}.`;
     document.querySelector('#reveal-password').disabled = false;
     notify('Credentials saved securely.');
   } catch (error) { errorBox.textContent = error.message; }
@@ -337,3 +348,4 @@ refresh().catch(error => {
   classList.innerHTML = `<p class="load-error">Couldn't load your local roster: ${esc(error.message)}. Restart the app server and refresh.</p>`;
   classList.hidden = false;
 });
+loadPlatform();
